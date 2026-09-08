@@ -10,7 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r gujarati_ocr/requirements-dev.txt -r 'paramrut scrapes/requirements-dev.txt'
+      - run: pip install -r gujarati_ocr/requirements-benchmark.txt -r 'paramrut scrapes/requirements-dev.txt'
       - run: python -m pytest tests -q
         working-directory: gujarati_ocr
       - run: python -m pytest tests -q

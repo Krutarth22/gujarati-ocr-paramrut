@@ -23,8 +23,14 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./outputs:/app/outputs
+      - ./models:/app/models:ro
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - OCR_PREPROCESSING=${OCR_PREPROCESSING:-legacy}
+      - OCR_PSM=${OCR_PSM:-4}
+      - OCR_LANG=${OCR_LANG:-guj+eng}
+      - OCR_TESSDATA_DIR=${OCR_TESSDATA_DIR:-}
+      - OCR_DESKEW=${OCR_DESKEW:-0}
       - OCR_BATCH_SIZE=5 # Change to 1 for low-RAM servers (like Oracle AMD Free Tier)
     depends_on:
       - redis

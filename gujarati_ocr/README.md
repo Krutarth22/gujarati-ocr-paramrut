@@ -108,3 +108,9 @@ Tesseract and Poppler. Google Vision additionally needs your own credentials:
 set `GOOGLE_APPLICATION_CREDENTIALS` to the absolute path of the local service
 account JSON in `secrets/`. Credentials and working documents are ignored by
 Git and Docker. Book-specific scripts may need local input paths adjusted.
+
+## Accuracy experiments
+
+See [BENCHMARK.md](BENCHMARK.md) for reproducible model/preprocessing comparisons,
+manual-reference scoring, and optional Google Vision evaluation. The existing
+profile remains the default until representative books establish a better one.

@@ -17,3 +17,6 @@ tmp
 *.log
 *.rdb
 .env*
+
+models
+benchmarks

@@ -55,3 +55,24 @@ def test_shrilipi_txt_pipeline(tmp_path):
     job.process()
     assert (tmp_path / 'result.docx').exists()
     assert (tmp_path / 'result.txt').exists()
+
+
+def test_pdf_and_text_use_same_recognition_settings(tmp_path, monkeypatch):
+    import io
+    source = tmp_path / 'input.pdf'
+    source.write_bytes(b'%PDF-')
+    job = processor.GujaratiPDFProcessor(str(source), str(tmp_path / 'out.docx'),
+        preprocessing='sauvola', ocr_psm=6, refine_metadata_lines=False)
+    monkeypatch.setattr(job, 'get_total_pages', lambda: 1)
+    monkeypatch.setattr(processor, 'convert_from_path', lambda *a, **kw: [Image.new('RGB', (20, 20), 'white')])
+    writer = PdfWriter()
+    writer.add_blank_page(width=20, height=20)
+    buf = io.BytesIO()
+    writer.write(buf)
+    pdf_ocr = Mock(return_value=buf.getvalue())
+    text_ocr = Mock(return_value='test text')
+    monkeypatch.setattr(processor.pytesseract, 'image_to_pdf_or_hocr', pdf_ocr)
+    monkeypatch.setattr(processor.pytesseract, 'image_to_string', text_ocr)
+    job.process()
+    assert pdf_ocr.call_args.kwargs['config'] == text_ocr.call_args.kwargs['config']
+    assert 'thresholding_method=2' in pdf_ocr.call_args.kwargs['config']

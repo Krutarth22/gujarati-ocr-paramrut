@@ -44,3 +44,7 @@ ui_inspection/
 gujarati_ocr/temp_*
 gujarati_ocr/test_input_*
 paramrut scrapes/*.png
+
+# Local OCR models, source samples, references, and benchmark results
+models/
+benchmarks/

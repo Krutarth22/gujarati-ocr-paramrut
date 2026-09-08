@@ -1,0 +1,13 @@
+pytesseract
+google-cloud-vision
+pdf2image
+pypdf
+python-docx
+tqdm
+fastapi
+uvicorn
+celery
+redis
+python-multipart
+Pillow
+docx2pdf

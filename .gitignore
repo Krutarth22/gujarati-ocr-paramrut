@@ -1,0 +1,46 @@
+# Local environments and build products
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+.DS_Store
+.claude/
+# Local credentials and machine configuration
+.env
+.env.*
+!.env.example
+secrets/
+*credentials*.json
+ocr-reviews-*.json
+*.pem
+*.key
+# Local documents, datasets, working files and cleanup backups
+archive/
+inputs/
+outputs/
+uploads/
+logs/
+rendered/
+tmp/
+apk_extracted/
+swamini_vaat/
+swamiji_diary/
+vachnamrut/
+paravani/
+scraped_content/
+ui_inspection/
+*.log
+*.pid
+*.rdb
+*.pdf
+*.docx
+*.epub
+*.apk
+*.zip
+*.bak
+gujarati_ocr/temp_*
+gujarati_ocr/test_input_*
+paramrut scrapes/*.png

@@ -1,137 +1,122 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import axios from 'axios'
 import { useDropzone } from 'react-dropzone'
+import { buildUploadForm } from './upload.js'
 import './App.css'
 
-const API_URL = 'http://localhost:8000'
+const API_URL = import.meta.env.VITE_API_URL || '/api'
+const errorMessage = err => typeof err.response?.data?.detail === 'string'
+  ? err.response.data.detail : 'Request failed. Check your connection and access token.'
 
 function App() {
   const [files, setFiles] = useState([])
   const [method, setMethod] = useState('ocr')
-  const [ocrOptions, setOcrOptions] = useState({
-    outputFormat: 'pdf',
-    pageRange: ''
-  })
-  const [shrilipiOptions, setShrilipiOptions] = useState({
-    outputFormat: 'txt',
-    preserveFormatting: false
-  })
+  const [token, setToken] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const submittingRef = useRef(false)
+  const timers = useRef(new Set())
+  const mounted = useRef(true)
+  const [ocrOptions, setOcrOptions] = useState({ outputFormat: 'pdf', pageRange: '' })
+  const [shrilipiOptions, setShrilipiOptions] = useState({ outputFormat: 'txt' })
   const [results, setResults] = useState([])
 
-  const onDrop = useCallback((acceptedFiles) => {
-    const newFiles = acceptedFiles.map(file => ({
-      file,
-      id: `${file.name}-${Date.now()}`,
-      name: file.name,
-      size: (file.size / (1024 * 1024)).toFixed(1) + ' MB',
-      pages: '-',
-      status: 'ready',
-      taskId: null
-    }))
-    setFiles(prev => [...prev, ...newFiles])
+  useEffect(() => {
+    mounted.current = true
+    const activeTimers = timers.current
+    return () => {
+      mounted.current = false
+      activeTimers.forEach(clearTimeout)
+      activeTimers.clear()
+    }
   }, [])
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop,
-    accept: { 'application/pdf': ['.pdf'] },
-    multiple: true
+  const onDrop = useCallback(acceptedFiles => {
+    setFiles(prev => [...prev, ...acceptedFiles.map(file => ({
+      file, id: crypto.randomUUID(), name: file.name,
+      size: (file.size / 1024 ** 2).toFixed(1) + ' MB', pages: '-', status: 'ready',
+    }))])
+  }, [])
+  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
+    onDrop, accept: { 'application/pdf': ['.pdf'] }, multiple: true,
   })
+  const removeFile = id => setFiles(prev => prev.filter(f => f.id !== id))
+  const clearAll = () => setFiles([])
 
-  const removeFile = (id) => {
-    setFiles(prev => prev.filter(f => f.id !== id))
-  }
-
-  const clearAll = () => {
-    setFiles([])
+  const pollStatus = (taskId, fileId, accessToken, started = Date.now(), failures = 0) => {
+    const timer = setTimeout(async () => {
+      timers.current.delete(timer)
+      if (!mounted.current) return
+      try {
+        const { data } = await axios.get(`${API_URL}/status/${taskId}`, {
+          headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000,
+        })
+        if (!mounted.current) return
+        const completed = data.state === 'SUCCESS'
+        const failed = data.state === 'FAILURE' || data.state === 'REVOKED'
+        setResults(prev => prev.map(r => r.id !== fileId ? r : {
+          ...r, status: completed ? 'completed' : failed ? 'error' : 'processing',
+          progress: completed ? 100 : data.current || 0,
+          message: data.status, formats: data.result?.formats || [],
+        }))
+        if (!completed && !failed) {
+          if (Date.now() - started > 45 * 60 * 1000) throw new Error('Job timed out.')
+          pollStatus(taskId, fileId, accessToken, started)
+        }
+      } catch (err) {
+        if (!mounted.current) return
+        if (failures < 2 && ![401, 404].includes(err.response?.status) && Date.now() - started < 45 * 60 * 1000) {
+          pollStatus(taskId, fileId, accessToken, started, failures + 1)
+        } else {
+          setResults(prev => prev.map(r => r.id !== fileId ? r : {
+            ...r, status: 'error', message: errorMessage(err),
+          }))
+        }
+      }
+    }, 2000)
+    timers.current.add(timer)
   }
 
   const processFiles = async () => {
-    const readyFiles = files.filter(f => f.status === 'ready')
-
-    for (const fileItem of readyFiles) {
-      try {
-        // Update status to processing
-        setFiles(prev => prev.map(f =>
-          f.id === fileItem.id ? { ...f, status: 'processing' } : f
-        ))
-
-        const formData = new FormData()
-        formData.append('file', fileItem.file)
-        formData.append('mode', method)
-
-        const response = await axios.post(`${API_URL}/upload`, formData, {
-          headers: { 'Content-Type': 'multipart/form-data' }
-        })
-
-        const taskId = response.data.task_id
-
-        // Add to results and start polling
-        setResults(prev => [...prev, {
-          id: fileItem.id,
-          name: fileItem.name,
-          taskId,
-          status: 'processing',
-          progress: 0,
-          message: 'Starting...',
-          pdfPath: null,
-          docxPath: null,
-          fileSize: null
-        }])
-
-        // Remove from files list
-        setFiles(prev => prev.filter(f => f.id !== fileItem.id))
-
-        // Start polling for this task
-        pollStatus(taskId, fileItem.id)
-
-      } catch (err) {
-        console.error(err)
-        setFiles(prev => prev.map(f =>
-          f.id === fileItem.id ? { ...f, status: 'error' } : f
-        ))
+    if (submittingRef.current || !token) return
+    submittingRef.current = true
+    setSubmitting(true)
+    try {
+      for (const item of files.filter(f => f.status === 'ready')) {
+        setFiles(prev => prev.map(f => f.id === item.id ? { ...f, status: 'processing' } : f))
+        try {
+          const options = method === 'ocr' ? ocrOptions : shrilipiOptions
+          const { data } = await axios.post(`${API_URL}/upload`, buildUploadForm(item.file, method, options), {
+            headers: { Authorization: `Bearer ${token}` }, timeout: 120000,
+          })
+          setResults(prev => [...prev, { id: item.id, name: item.name, taskId: data.task_id,
+            status: 'processing', progress: 0, message: 'Starting...', formats: [] }])
+          setFiles(prev => prev.filter(f => f.id !== item.id))
+          pollStatus(data.task_id, item.id, token)
+        } catch (err) {
+          setFiles(prev => prev.map(f => f.id === item.id ? { ...f, status: 'error', error: errorMessage(err) } : f))
+        }
       }
+    } finally {
+      submittingRef.current = false
+      setSubmitting(false)
     }
   }
 
-  const pollStatus = (taskId, fileId) => {
-    const interval = setInterval(async () => {
-      try {
-        const response = await axios.get(`${API_URL}/status/${taskId}`)
-        const data = response.data
-
-        setResults(prev => prev.map(r => {
-          if (r.id !== fileId) return r
-
-          if (data.state === 'SUCCESS') {
-            clearInterval(interval)
-            return {
-              ...r,
-              status: 'completed',
-              progress: 100,
-              message: 'Completed',
-              pdfPath: data.result?.pdf_path,
-              docxPath: data.result?.docx_path,
-              pdfGenerated: data.result?.pdf_generated
-            }
-          } else if (data.state === 'FAILURE') {
-            clearInterval(interval)
-            return {
-              ...r,
-              status: 'error',
-              message: data.status || 'Failed'
-            }
-          } else {
-            return {
-              ...r,
-              progress: data.current || 0,
-              message: data.status || 'Processing...'
-            }
-          }
-        }))
-      } catch (err) {
-        console.error(err)
-      }
-    }, 2000)
+  const downloadResult = async (result, format) => {
+    try {
+      const { data } = await axios.get(`${API_URL}/download/${result.taskId}/${format}`, {
+        headers: { Authorization: `Bearer ${token}` }, responseType: 'blob', timeout: 120000,
+      })
+      const url = URL.createObjectURL(data)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `${result.name.replace(/\.pdf$/i, '')}.${format}`
+      anchor.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch {
+      setResults(prev => prev.map(r => r.id === result.id
+        ? { ...r, downloadError: 'Download failed. Check your token; files may have expired.' } : r))
+    }
   }
 
   const getStatusBadge = (status) => {
@@ -157,18 +142,23 @@ function App() {
           </div>
         </div>
         <div className="header-right">
-          <button className="help-btn">?</button>
+          <span title="Choose OCR for scans or Shree Lipi for legacy font text.">?</span>
         </div>
       </header>
 
       <main className="main">
+        <label className="option-group">
+          Access token
+          <input type="password" value={token} autoComplete="off"
+            onChange={e => setToken(e.target.value)} placeholder="Enter the server access token" />
+        </label>
         {/* Dropzone */}
         <div {...getRootProps()} className={`dropzone ${isDragActive ? 'active' : ''}`}>
           <input {...getInputProps()} />
           <div className="dropzone-content">
             <div className="cloud-icon">☁️</div>
             <p className="dropzone-text">Drop Gujarati PDFs here</p>
-            <button className="browse-btn" onClick={(e) => e.stopPropagation()}>
+            <button className="browse-btn" onClick={(e) => { e.stopPropagation(); open() }}>
               Browse files
             </button>
           </div>
@@ -200,7 +190,7 @@ function App() {
                     </td>
                     <td>{file.size}</td>
                     <td>{file.pages}</td>
-                    <td>{getStatusBadge(file.status)}</td>
+                    <td>{getStatusBadge(file.status)}{file.error && <span className="error-text">{file.error}</span>}</td>
                     <td>
                       <button className="delete-btn" onClick={() => removeFile(file.id)}>🗑️</button>
                     </td>
@@ -215,7 +205,7 @@ function App() {
         <div className="method-section">
           <div className="method-header">
             <h3>Choose a method</h3>
-            <a href="#" className="help-link">Not sure which to choose? ↗</a>
+            <span className="help-link">OCR for scans; Shree Lipi for legacy font text.</span>
           </div>
 
           <div className="method-cards">
@@ -325,17 +315,7 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="option-group toggle-option">
-                    <label>Preserve formatting</label>
-                    <label className="switch">
-                      <input
-                        type="checkbox"
-                        checked={shrilipiOptions.preserveFormatting}
-                        onChange={(e) => setShrilipiOptions({ ...shrilipiOptions, preserveFormatting: e.target.checked })}
-                      />
-                      <span className="slider"></span>
-                    </label>
-                  </div>
+
                 </div>
               )}
             </div>
@@ -343,10 +323,9 @@ function App() {
 
           {/* Action Buttons */}
           <div className="action-buttons">
-            <button className="preview-btn">Preview first page</button>
             <button
               className="process-btn"
-              disabled={files.length === 0}
+              disabled={!files.some(f => f.status === 'ready') || submitting || !token}
               onClick={processFiles}
             >
               Process Files →
@@ -389,26 +368,13 @@ function App() {
                     )}
                     {result.status === 'completed' && (
                       <div className="result-actions">
-                        {result.pdfGenerated && (
-                          <a
-                            href={`${API_URL}/download/${result.taskId}/pdf`}
-                            className="download-btn primary"
-                            target="_blank"
-                            rel="noreferrer"
-                            download
-                          >
-                            ⬇ PDF
-                          </a>
-                        )}
-                        <a
-                          href={`${API_URL}/download/${result.taskId}/docx`}
-                          className="download-btn secondary"
-                          target="_blank"
-                          rel="noreferrer"
-                          download
-                        >
-                          📄 DOCX
-                        </a>
+                        {(result.formats || []).map(format => (
+                          <button key={format} className="download-btn secondary"
+                            onClick={() => downloadResult(result, format)}>
+                            Download {format.toUpperCase()}
+                          </button>
+                        ))}
+                        {result.downloadError && <span className="error-text">{result.downloadError}</span>}
                       </div>
                     )}
                     {result.status === 'error' && (
@@ -422,7 +388,7 @@ function App() {
         )}
 
         {/* Footer Note */}
-        <p className="footer-note">🔒 Files processed securely; automatically deleted after 1 hour.</p>
+        <p className="footer-note">Files are retained for 24 hours after processing and removed during hourly cleanup. Downloads require your access token.</p>
       </main>
     </div>
   )

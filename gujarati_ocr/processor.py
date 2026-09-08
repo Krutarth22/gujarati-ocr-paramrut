@@ -31,6 +31,8 @@ except ImportError as e:
     sys.exit(1)
 
 from shri_lipi_converter import convert_shri_lipi_to_unicode
+from page_ranges import parse_page_range
+from ocr_profiles import PREPROCESSING, tesseract_config, deskew_image
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +95,9 @@ class GujaratiPDFProcessor:
         crop_box: tuple[float, float, float, float] = None,
         ocr_engine: OCREngine = OCREngine.TESSERACT,
         google_credentials_path: str = None,
+        preprocessing: str = "legacy",
+        tessdata_dir: str = None,
+        deskew: bool = False,
     ):
         """
         Initialize the processor.
@@ -117,6 +122,8 @@ class GujaratiPDFProcessor:
         self.output_docx_path = output_docx_path
         self.output_pdf_path = output_pdf_path
         self.mode = mode
+        if batch_size < 1 or dpi < 1:
+            raise ValueError("Batch size and DPI must be positive.")
         self.batch_size = batch_size
         self.lang = lang
         self.dpi = dpi
@@ -131,6 +138,18 @@ class GujaratiPDFProcessor:
         self.ocr_engine = ocr_engine
         self.google_credentials_path = google_credentials_path
         self._vision_client = None
+        if preprocessing not in PREPROCESSING:
+            raise ValueError('Unknown preprocessing profile.')
+        self.preprocessing = preprocessing
+        self.tessdata_dir = tessdata_dir
+        self.deskew = deskew
+        # Validate model selection early, before a long job starts.
+        if tessdata_dir:
+            from pathlib import Path
+            for language in self.lang.split('+'):
+                if not (Path(tessdata_dir) / f'{language}.traineddata').is_file():
+                    raise ValueError(f'Missing traineddata model for {language}.')
+
 
         if not os.path.exists(input_pdf_path):
             raise FileNotFoundError(f"Input file not found: {input_pdf_path}")
@@ -177,28 +196,7 @@ class GujaratiPDFProcessor:
                 raise
 
     def _parse_page_range(self, total_pages: int) -> list:
-        """
-        Parse page range string into list of page numbers.
-        Examples: "1-5" -> [1,2,3,4,5], "1-3,5,7-9" -> [1,2,3,5,7,8,9]
-        """
-        if not self.page_range:
-            return list(range(1, total_pages + 1))
-        
-        pages = set()
-        parts = self.page_range.replace(' ', '').split(',')
-        
-        for part in parts:
-            if '-' in part:
-                start, end = part.split('-')
-                start = int(start)
-                end = int(end)
-                pages.update(range(start, min(end + 1, total_pages + 1)))
-            else:
-                page = int(part)
-                if 1 <= page <= total_pages:
-                    pages.add(page)
-        
-        return sorted(list(pages))
+        return parse_page_range(self.page_range, total_pages)
 
     def process(self, progress_callback: Optional[Callable[[int, str], None]] = None):
         """
@@ -245,6 +243,8 @@ class GujaratiPDFProcessor:
                                 dpi=self.dpi
                             )
                             
+                            if not images:
+                                raise RuntimeError("PDF renderer returned no image.")
                             if images:
                                 if self.ocr_engine == OCREngine.VISION:
                                     text = self._extract_page_text_vision(images[0])
@@ -261,10 +261,11 @@ class GujaratiPDFProcessor:
 
                                         # 1. PDF Generation
                                         if not self.text_only:
-                                            pdf_bytes = pytesseract.image_to_pdf_or_hocr(temp_img_path, extension='pdf', lang=self.lang)
+                                            pdf_bytes = pytesseract.image_to_pdf_or_hocr(temp_img_path, extension='pdf', lang=self.lang, config=self._tesseract_config())
                                             pdf_page_reader = PdfReader(io.BytesIO(pdf_bytes))
-                                            if len(pdf_page_reader.pages) > 0:
-                                                pdf_writer.add_page(pdf_page_reader.pages[0])
+                                            if not pdf_page_reader.pages:
+                                                raise RuntimeError('OCR returned no searchable PDF page.')
+                                            pdf_writer.add_page(pdf_page_reader.pages[0])
 
                                         # 2. Extract Text for DOCX
                                         text = self._extract_page_text(
@@ -283,7 +284,7 @@ class GujaratiPDFProcessor:
                             del images
                         except Exception as e:
                             logger.error(f"Error processing page {page_num}: {e}")
-                            continue
+                            raise RuntimeError(f"OCR failed on page {page_num}; document is incomplete.") from e
                         
                         processed += 1
                         pbar.update(1)
@@ -382,12 +383,16 @@ class GujaratiPDFProcessor:
         except Exception as e:
             logger.error(f"Failed to split large PDF: {e}")
 
+    def _tesseract_config(self, psm=None):
+        return tesseract_config(psm if psm is not None else self.ocr_psm,
+                                self.preprocessing, self.tessdata_dir)
+
     def _extract_page_text(self, source_image: Image.Image, processed_image_path: str) -> str:
         """Run the main OCR pass and then repair likely metadata header lines."""
-        custom_config = f'--psm {self.ocr_psm} -c preserve_interword_spaces=1'
+        custom_config = self._tesseract_config()
         raw_text = pytesseract.image_to_string(processed_image_path, lang=self.lang, config=custom_config)
         text = self._clean_text(raw_text)
-        if not self.refine_metadata_lines:
+        if not self.refine_metadata_lines or self.deskew:
             return text
         return self._refine_metadata_lines(source_image, processed_image_path, text)
 
@@ -408,7 +413,7 @@ class GujaratiPDFProcessor:
         )
         if response.error.message:
             logger.error(f"Vision API error: {response.error.message}")
-            return ""
+            raise RuntimeError("Google Vision OCR request failed.")
 
         text = response.full_text_annotation.text
         return self._clean_text(text)
@@ -422,6 +427,11 @@ class GujaratiPDFProcessor:
             if self.crop_box:
                 image = self._crop_by_ratios(image, self.crop_box)
 
+            if self.deskew:
+                image = deskew_image(image)
+            if self.preprocessing in ('grayscale', 'sauvola'):
+                # Preserve faint marks; let Tesseract perform binarization.
+                return image.convert('L')
             image = self._remove_colored_annotations(image)
 
             # 1. Convert to grayscale
@@ -481,7 +491,7 @@ class GujaratiPDFProcessor:
         colored_markup = (saturation_delta > 35) & (channels_max > 120)
         arr[colored_markup] = [255, 255, 255]
 
-        return Image.fromarray(arr, mode='RGB')
+        return Image.fromarray(arr)
 
     def _clean_text(self, text: str) -> str:
         """
@@ -545,7 +555,7 @@ class GujaratiPDFProcessor:
         data = pytesseract.image_to_data(
             processed_image_path,
             lang=self.lang,
-            config='--psm 3',
+            config=self._tesseract_config(3),
             output_type=pytesseract.Output.DICT
         )
 
@@ -632,8 +642,8 @@ class GujaratiPDFProcessor:
 
         variants = self._build_metadata_crop_variants(crop)
         configs = (
-            '--psm 7 -c preserve_interword_spaces=1',
-            '--psm 6 -c preserve_interword_spaces=1',
+            self._tesseract_config(7),
+            self._tesseract_config(6),
         )
 
         best_line = ""
@@ -864,7 +874,7 @@ class GujaratiPDFProcessor:
                     
                     # 1. Generate Searchable PDF Page
                     if not self.text_only:
-                        pdf_bytes = pytesseract.image_to_pdf_or_hocr(temp_img_path, extension='pdf', lang=self.lang)
+                        pdf_bytes = pytesseract.image_to_pdf_or_hocr(temp_img_path, extension='pdf', lang=self.lang, config=self._tesseract_config())
                         pdf_page_reader = PdfReader(io.BytesIO(pdf_bytes))
                         if len(pdf_page_reader.pages) > 0:
                             pdf_writer.add_page(pdf_page_reader.pages[0])
@@ -993,10 +1003,15 @@ def convert_docx_to_pdf(docx_path: str, pdf_path: str = None) -> str:
         output_dir = os.path.dirname(pdf_path) or "."
         
         logger.info(f"Attempting PDF conversion with LibreOffice...")
-        result = subprocess.run([
-            soffice_cmd, '--headless', '--convert-to', 'pdf',
-            '--outdir', output_dir, docx_path
-        ], capture_output=True, text=True, timeout=120)
+        # Each worker gets its own LibreOffice profile so concurrent conversions
+        # cannot attach to another job's process and return before output exists.
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(prefix='ocr-libreoffice-') as profile:
+            result = subprocess.run([
+                soffice_cmd, f'-env:UserInstallation={Path(profile).as_uri()}',
+                '--headless', '--convert-to', 'pdf',
+                '--outdir', output_dir, docx_path
+            ], capture_output=True, text=True, timeout=120)
         
         if result.returncode == 0:
             # LibreOffice outputs to same basename with .pdf
@@ -1066,6 +1081,10 @@ if __name__ == "__main__":
     parser.add_argument("--lang", default="guj", help="Tesseract language code (default: guj)")
     parser.add_argument("--dpi", type=int, default=300, help="DPI for rasterization (default: 300)")
     parser.add_argument("--page_range", help="Pages to process, e.g. '1-5,8,10-12'")
+    parser.add_argument("--preprocessing", choices=PREPROCESSING, default="legacy",
+                        help="Explicit candidate profile; benchmark before changing defaults")
+    parser.add_argument("--tessdata_dir", help="Directory containing guj/eng.traineddata models")
+    parser.add_argument("--deskew", action="store_true", help="Try small-angle deskew; disables metadata crop refinement")
     parser.add_argument("--ocr_psm", type=int, default=4, help="Tesseract page segmentation mode for main OCR (default: 4)")
     parser.add_argument(
         "--crop_box",
@@ -1120,6 +1139,9 @@ if __name__ == "__main__":
         crop_box=crop_box,
         ocr_engine=OCREngine.VISION if args.engine == "vision" else OCREngine.TESSERACT,
         google_credentials_path=args.google_credentials,
+        preprocessing=args.preprocessing,
+        tessdata_dir=args.tessdata_dir,
+        deskew=args.deskew,
     )
     
     try:

@@ -11,12 +11,16 @@ echo "🚀 Starting Gujarati PDF Processor..."
 echo ""
 
 # Create log directory
+if [ "${#OCR_API_TOKEN}" -lt 32 ]; then
+    echo "Set OCR_API_TOKEN to a random token of at least 32 characters before starting."
+    exit 1
+fi
 mkdir -p logs
 
 # Start Redis
 echo "1️⃣  Starting Redis..."
 if ! pgrep redis-server > /dev/null; then
-    redis-server --daemonize yes --logfile "$PROJECT_DIR/logs/redis.log"
+    redis-server --bind 127.0.0.1 --protected-mode yes --daemonize yes --logfile "$PROJECT_DIR/logs/redis.log"
     echo "   Redis started"
 else
     echo "   Redis already running"
@@ -34,14 +38,14 @@ else
     CELERY_CMD="celery"
 fi
 
-nohup $CELERY_CMD -A worker worker --loglevel=info > "$PROJECT_DIR/logs/celery.log" 2>&1 &
+nohup $CELERY_CMD -A worker worker --loglevel=info --concurrency=2 > "$PROJECT_DIR/logs/celery.log" 2>&1 &
 CELERY_PID=$!
 echo "   Celery started (PID: $CELERY_PID)"
 sleep 2
 
 # Start Backend API
 echo "3️⃣  Starting Backend API..."
-nohup $PYTHON_CMD -m uvicorn app:app --host 0.0.0.0 --port 8000 > "$PROJECT_DIR/logs/backend.log" 2>&1 &
+nohup $PYTHON_CMD -m uvicorn app:app --host 127.0.0.1 --port 8000 > "$PROJECT_DIR/logs/backend.log" 2>&1 &
 BACKEND_PID=$!
 echo "   Backend started (PID: $BACKEND_PID)"
 sleep 2

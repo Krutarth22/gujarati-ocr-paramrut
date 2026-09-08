@@ -1,243 +1,251 @@
+import asyncio
+import contextlib
+import logging
 import os
+import secrets
 import shutil
 import time
-import asyncio
-import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import UUID, uuid4
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from celery.result import AsyncResult
-from worker import process_task
+from fastapi.responses import FileResponse, JSONResponse
 from pdf2image import pdfinfo_from_path
+from redis.exceptions import RedisError
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+from job_limits import QUEUE_WAIT_SECONDS, reserve_job, release_job
+from page_ranges import parse_page_range
+from worker import celery_app, process_task
+
 logger = logging.getLogger(__name__)
+UPLOAD_DIR = Path(os.getenv('UPLOAD_DIR', 'uploads'))
+OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', 'outputs'))
+MAX_UPLOAD_BYTES = int(os.getenv('MAX_UPLOAD_MB', '50')) * 1024 * 1024
+MAX_PAGES = int(os.getenv('MAX_PDF_PAGES', '500'))
+RETENTION_SECONDS = 24 * 3600
 
-# Directories
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "outputs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def cleanup_old_files():
-    """Delete files older than 24 hours."""
-    logger.info("Running cleanup task...")
-    now = time.time()
-    cutoff = now - (24 * 3600) # 24 hours in seconds
-    
-    count = 0
-    for folder in [UPLOAD_DIR, OUTPUT_DIR]:
-        for f in os.listdir(folder):
-            path = os.path.join(folder, f)
-            if os.path.isfile(path):
-                try:
-                    if os.path.getmtime(path) < cutoff:
-                        os.remove(path)
-                        count += 1
-                        logger.info(f"Deleted old file: {path}")
-                except Exception as e:
-                    logger.error(f"Error deleting {path}: {e}")
-    
-    if count > 0:
-        logger.info(f"Cleanup complete. Deleted {count} files.")
-    else:
-        logger.info("Cleanup complete. No old files found.")
+    """Remove expired job directories and legacy files; never follow symlinks."""
+    cutoff = time.time() - RETENTION_SECONDS
+    for folder in (UPLOAD_DIR, OUTPUT_DIR):
+        for path in folder.iterdir():
+            if path.is_symlink():
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    if path.is_dir():
+                        # Only delete generated UUID job directories.
+                        if str(UUID(path.name)) != path.name:
+                            continue
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+            except (OSError, ValueError):
+                logger.exception('Cleanup failed for %s', path.name)
+
 
 async def periodic_cleanup():
-    """Run cleanup every hour."""
     while True:
-        cleanup_old_files()
-        await asyncio.sleep(3600) # Sleep for 1 hour
+        await asyncio.to_thread(cleanup_old_files)
+        await asyncio.sleep(3600)
+
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: Start background task
+async def lifespan(app):
+    if len(os.getenv('OCR_API_TOKEN', '')) < 32:
+        raise RuntimeError('Set OCR_API_TOKEN to a random token of at least 32 characters.')
+    for folder in (UPLOAD_DIR, OUTPUT_DIR):
+        folder.mkdir(parents=True, exist_ok=True)
     task = asyncio.create_task(periodic_cleanup())
-    yield
-    # Shutdown: Cancel task
-    task.cancel()
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
-app = FastAPI(title="Gujarati PDF Processor API", lifespan=lifespan)
 
-# Configure CORS
+class AccessGuard:
+    """Authenticate before parsing multipart bodies and cap request sizes."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        headers = dict(scope['headers'])
+        expected = os.getenv('OCR_API_TOKEN', '')
+        supplied = headers.get(b'authorization', b'')
+        if len(expected) < 32 or not secrets.compare_digest(supplied, f'Bearer {expected}'.encode()):
+            return await JSONResponse({'detail': 'Valid access token required.'}, 401)(scope, receive, send)
+        if scope['method'] == 'POST':
+            try:
+                length = int(headers.get(b'content-length', b'-1'))
+            except ValueError:
+                length = -1
+            if length < 0:
+                return await JSONResponse({'detail': 'Content-Length is required.'}, 411)(scope, receive, send)
+            if length > MAX_UPLOAD_BYTES + 1024 * 1024:
+                return await JSONResponse({'detail': 'Upload exceeds the size limit.'}, 413)(scope, receive, send)
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            received += len(message.get('body', b''))
+            if received > MAX_UPLOAD_BYTES + 1024 * 1024:
+                raise HTTPException(413, 'Upload exceeds the size limit.')
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+app = FastAPI(title='Gujarati PDF Processor API', lifespan=lifespan)
+app.add_middleware(AccessGuard)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=os.getenv('OCR_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(','),
+    allow_methods=['GET', 'POST'],
+    allow_headers=['Authorization', 'Content-Type'],
 )
 
-@app.post("/pdf-info")
-async def get_pdf_info(file: UploadFile = File(...)):
-    """Get metadata about uploaded PDF before processing."""
+
+def save_pdf(file, path):
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(400, 'Only PDF files are allowed.')
+    size = 0
+    with path.open('xb') as target:
+        while chunk := file.file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, 'Upload exceeds the size limit.')
+            if size == len(chunk) and not chunk.startswith(b'%PDF-'):
+                raise HTTPException(400, 'Invalid PDF file.')
+            target.write(chunk)
+    if not size:
+        raise HTTPException(400, 'Empty PDF file.')
     try:
-        # Save temporarily
-        temp_path = os.path.join(UPLOAD_DIR, f"temp_{file.filename}")
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Get PDF info
-        info = pdfinfo_from_path(temp_path)
-        
-        # Delete temp file
-        os.remove(temp_path)
-        
-        return {
-            "filename": file.filename,
-            "pages": info.get("Pages", 0),
-            "size_mb": round(file.size / (1024 * 1024), 1) if file.size else 0
-        }
-    except Exception as e:
-        logger.error(f"Error getting PDF info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        pages = pdfinfo_from_path(str(path), timeout=30)['Pages']
+    except Exception as exc:
+        raise HTTPException(400, 'Cannot read this PDF. Check that it is valid and unencrypted.') from exc
+    if not 1 <= pages <= MAX_PAGES:
+        raise HTTPException(400, f'PDF must contain between 1 and {MAX_PAGES} pages.')
+    return size, pages
 
-@app.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    mode: str = Form(default="ocr"),
-    page_range: str = Form(default=""),
-    output_format: str = Form(default="pdf")
-):
-    """
-    Upload a PDF file and start processing.
-    
-    Args:
-        file: PDF file to upload
-        mode: Processing mode - 'ocr' or 'shrilipi'
-        page_range: Page range (e.g., "1-5, 8")
-        output_format: Output format - 'pdf', 'docx', 'txt', or 'md'
-    """
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-    
-    # Validate mode
-    if mode not in ["ocr", "shrilipi"]:
-        raise HTTPException(status_code=400, detail="Mode must be 'ocr' or 'shrilipi'.")
 
-    allowed_output_formats = {
-        "ocr": {"pdf", "docx", "txt"},
-        "shrilipi": {"pdf", "docx", "txt", "md"},
-    }
-    if output_format not in allowed_output_formats[mode]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid output format for {mode}. Allowed: {sorted(allowed_output_formats[mode])}."
-        )
+def new_job_dirs(task_id):
+    incoming, outgoing = UPLOAD_DIR / task_id, OUTPUT_DIR / task_id
+    incoming.mkdir(parents=True)
+    try:
+        outgoing.mkdir(parents=True)
+    except Exception:
+        shutil.rmtree(incoming, ignore_errors=True)
+        raise
+    return incoming, outgoing
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    
-    # Save uploaded file
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
 
-    # Define output paths
-    base_name = os.path.splitext(file.filename)[0]
-    suffix = "_ocr" if mode == "ocr" else "_unicode"
-    
-    output_docx_path = os.path.join(OUTPUT_DIR, f"{base_name}{suffix}.docx")
-    output_pdf_path = os.path.join(OUTPUT_DIR, f"{base_name}{suffix}.pdf")
-    output_txt_path = os.path.join(OUTPUT_DIR, f"{base_name}{suffix}.txt")
-    output_md_path = os.path.join(OUTPUT_DIR, f"{base_name}{suffix}.md")
+@app.post('/pdf-info')
+def get_pdf_info(file: UploadFile = File(...)):
+    task_id = str(uuid4())
+    try:
+        if not reserve_job(task_id):
+            raise HTTPException(429, 'Processing queue is full. Try again later.')
+    except RedisError as exc:
+        raise HTTPException(503, 'Processing queue is unavailable.') from exc
+    incoming = outgoing = None
+    try:
+        incoming, outgoing = new_job_dirs(task_id)
+        size, pages = save_pdf(file, incoming / 'input.pdf')
+        return {'filename': file.filename, 'pages': pages, 'size_mb': round(size / 1024**2, 1)}
+    finally:
+        for directory in (incoming, outgoing):
+            if directory:
+                shutil.rmtree(directory, ignore_errors=True)
+        with contextlib.suppress(RedisError):
+            release_job(task_id)
 
-    # Clean page range
-    page_range = page_range.strip() if page_range else None
 
-    # Start Celery task
-    task = process_task.delay(
-        file_path, 
-        output_docx_path, 
-        output_pdf_path, 
-        mode,
-        page_range,
-        output_format,
-        output_txt_path if output_format == 'txt' else None,
-        output_md_path if output_format == 'md' else None
-    )
+@app.post('/upload')
+def upload_file(file: UploadFile = File(...), mode: str = Form('ocr'),
+                page_range: str = Form(''), output_format: str = Form('pdf')):
+    allowed = {'ocr': {'pdf', 'docx', 'txt'}, 'shrilipi': {'pdf', 'docx', 'txt', 'md'}}
+    if mode not in allowed or output_format not in allowed[mode]:
+        raise HTTPException(400, 'Invalid processing mode or output format.')
+    task_id = str(uuid4())
+    try:
+        if not reserve_job(task_id):
+            raise HTTPException(429, 'Processing queue is full. Try again later.')
+    except RedisError as exc:
+        raise HTTPException(503, 'Processing queue is unavailable.') from exc
+    incoming = outgoing = None
+    try:
+        incoming, outgoing = new_job_dirs(task_id)
+        _, pages = save_pdf(file, incoming / 'input.pdf')
+        try:
+            parse_page_range(page_range, pages)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        process_task.apply_async(args=[
+            str(incoming / 'input.pdf'), str(outgoing / 'result.docx'),
+            str(outgoing / 'result.pdf'), mode, page_range.strip() or None,
+            output_format, str(outgoing / 'result.txt') if output_format == 'txt' else None,
+            str(outgoing / 'result.md') if output_format == 'md' else None,
+        ], task_id=task_id, expires=QUEUE_WAIT_SECONDS)
+    except Exception:
+        for directory in (incoming, outgoing):
+            if directory:
+                shutil.rmtree(directory, ignore_errors=True)
+        with contextlib.suppress(RedisError):
+            release_job(task_id)
+        raise
+    return {'task_id': task_id, 'filename': file.filename, 'mode': mode,
+            'page_range': page_range, 'output_format': output_format}
 
-    return {
-        "task_id": task.id, 
-        "filename": file.filename,
-        "mode": mode,
-        "page_range": page_range,
-        "output_format": output_format
-    }
 
-@app.get("/status/{task_id}")
-async def get_status(task_id: str):
-    """
-    Get the status of a processing task.
-    """
-    task_result = AsyncResult(task_id)
-    
-    if task_result.state == 'PENDING':
-        response = {
-            'state': task_result.state,
-            'current': 0,
-            'total': 100,
-            'status': 'Pending...'
-        }
-    elif task_result.state != 'FAILURE':
-        response = {
-            'state': task_result.state,
-            'current': task_result.info.get('current', 0) if isinstance(task_result.info, dict) else 0,
-            'total': task_result.info.get('total', 100) if isinstance(task_result.info, dict) else 100,
-            'status': task_result.info.get('status', '') if isinstance(task_result.info, dict) else str(task_result.info)
-        }
-        if isinstance(task_result.info, dict):
-            response['result'] = task_result.info
-    else:
-        # something went wrong in the background job
-        response = {
-            'state': task_result.state,
-            'current': 100,
-            'total': 100,
-            'status': str(task_result.info),
-        }
-        
+def task_result(task_id):
+    try:
+        if str(UUID(task_id)) != task_id:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(404, 'Job not found.') from exc
+    if not (OUTPUT_DIR / task_id).is_dir():
+        raise HTTPException(404, 'Job not found or files expired.')
+    return celery_app.AsyncResult(task_id)
+
+
+@app.get('/status/{task_id}')
+def get_status(task_id: str):
+    result = task_result(task_id)
+    if result.state in ('FAILURE', 'REVOKED'):
+        return {'state': 'FAILURE', 'current': 0, 'total': 100,
+                'status': 'Processing failed or expired. No complete document is available; check server logs.'}
+    info = result.info if isinstance(result.info, dict) else {}
+    response = {'state': result.state, 'current': info.get('current', 0), 'total': 100,
+                'status': info.get('status', 'Pending...')}
+    if result.state == 'SUCCESS':
+        response['result'] = {'formats': [ext for ext in ('pdf', 'docx', 'txt', 'md')
+                                         if (OUTPUT_DIR / task_id / f'result.{ext}').is_file()]}
     return response
 
-@app.get("/download/{task_id}/{file_type}")
-async def download_file(task_id: str, file_type: str):
-    """
-    Download the generated file (docx, pdf, txt, or md).
-    """
-    task_result = AsyncResult(task_id)
-    
-    if task_result.state != 'SUCCESS':
-         raise HTTPException(status_code=400, detail="Task not completed yet.")
-         
-    result = task_result.result
-    
-    if file_type == 'docx':
-        path = result.get('docx_path')
-        media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    elif file_type == 'pdf':
-        if not result.get('pdf_generated'):
-            raise HTTPException(status_code=404, detail="PDF conversion failed. Only DOCX is available.")
-        path = result.get('pdf_path')
-        media_type = 'application/pdf'
-    elif file_type == 'txt':
-        path = result.get('txt_path')
-        if not path:
-            raise HTTPException(status_code=404, detail="TXT output not generated.")
-        media_type = 'text/plain'
-    elif file_type == 'md':
-        path = result.get('md_path')
-        if not path:
-            raise HTTPException(status_code=404, detail="Markdown output not generated.")
-        media_type = 'text/markdown'
-    else:
-        raise HTTPException(status_code=400, detail="Invalid file type. Use 'docx', 'pdf', 'txt', or 'md'.")
-    
-    if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found.")
-    
-    filename = os.path.basename(path)
-    return FileResponse(path, media_type=media_type, filename=filename)
 
-if __name__ == "__main__":
+@app.get('/download/{task_id}/{file_type}')
+def download_file(task_id: str, file_type: str):
+    types = {'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+             'pdf': 'application/pdf', 'txt': 'text/plain', 'md': 'text/markdown'}
+    if file_type not in types:
+        raise HTTPException(400, 'Invalid file type.')
+    if task_result(task_id).state != 'SUCCESS':
+        raise HTTPException(400, 'Job has not completed successfully.')
+    directory = (OUTPUT_DIR / task_id).resolve()
+    path = directory / f'result.{file_type}'
+    if not path.is_file() or path.is_symlink() or path.resolve().parent != directory:
+        raise HTTPException(404, 'Output not generated or expired.')
+    return FileResponse(path, media_type=types[file_type], filename=f'result.{file_type}')
+
+
+if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host='127.0.0.1', port=8000)

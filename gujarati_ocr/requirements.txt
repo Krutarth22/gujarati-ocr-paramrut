@@ -11,3 +11,4 @@ redis
 python-multipart
 Pillow
 docx2pdf
+numpy

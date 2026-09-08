@@ -1,103 +1,110 @@
 # Gujarati PDF Processor
 
-A unified web application for processing Gujarati PDFs. Supports two modes:
+FastAPI + Celery + React tools for Gujarati OCR and Shri Lipi conversion.
+OCR supports searchable PDF, DOCX, and TXT through the API; the UI offers PDF
+and DOCX. Shri Lipi supports PDF, DOCX, TXT, and Markdown through the API;
+the UI offers TXT and Markdown. The UI sends the selected format and OCR page
+range to the backend and displays downloads for generated files.
 
-1. **OCR Mode**: Convert scanned Gujarati PDFs to Word documents using Tesseract OCR
-2. **Shrilipi Mode**: Extract and convert Shri Lipi font text to Unicode Gujarati
+## Local setup
 
-## Features
+Use Python 3.10+ and Node.js 22.12+. On macOS:
 
-- Web-based interface with drag-and-drop file upload
-- Mode selection (OCR or Shrilipi conversion)
-- Real-time progress tracking
-- DOCX output for easy editing
-
-## Prerequisites
-
-- Python 3.10+
-- Node.js 22.12+ (for frontend)
-- Redis server (for task queue)
-- Tesseract OCR with Gujarati support (for OCR mode)
-- Poppler (for PDF rendering)
-
-### Install Dependencies
-
-**macOS:**
 ```bash
 brew install tesseract tesseract-lang poppler redis
-```
-
-**Linux (Ubuntu/Debian):**
-```bash
-sudo apt install tesseract-ocr tesseract-ocr-guj poppler-utils redis-server
-```
-
-## Quick Start
-
-### 1. Install Python dependencies
-```bash
+brew install --cask libreoffice
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+(cd frontend && npm ci)
+export OCR_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+./start_app.sh
 ```
 
-### 2. Install frontend dependencies
-```bash
-cd frontend
-npm install
-```
+Keep `OCR_API_TOKEN` in your shell or a local secret manager. Enter the same
+value in the interface at http://localhost:5173. The UI keeps it in memory only;
+it is not embedded in the frontend bundle or placed in download URLs.
+The server refuses to start without a token of at least 32 characters.
+Export the same token in any separate API terminal.
 
-### 3. Start Redis
-```bash
-redis-server
-```
+On Ubuntu/Debian install `tesseract-ocr`, `tesseract-ocr-guj`, `poppler-utils`,
+`redis-server`, `libreoffice-writer`, and `fonts-noto-core`.
 
-### 4. Start Celery worker (new terminal)
-```bash
-celery -A worker worker --loglevel=info
-```
+To start services manually, run these in separate terminals from this directory:
 
-### 5. Start API server (new terminal)
 ```bash
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 6. Start frontend (new terminal)
-```bash
+redis-server --bind 127.0.0.1 --protected-mode yes
+celery -A worker.celery_app worker --loglevel=info --concurrency=2
+uvicorn app:app --host 127.0.0.1 --port 8000
+# Frontend terminal:
 cd frontend
 npm run dev
 ```
 
-Open http://localhost:5173 in your browser.
+## Docker
 
-## CLI Usage
+Export `OCR_API_TOKEN` as above, then run `docker compose up --build`.
+Redis is internal to the Compose network. API and frontend ports bind to
+localhost. LibreOffice and Gujarati-capable Noto fonts are installed in the
+backend/worker image. Only upload and output folders are mounted, not the
+source tree or local credentials. The frontend proxy uses the backend service.
 
-### OCR Mode (scanned PDFs)
+## Access and limits
+
+All API requests require `Authorization: Bearer <OCR_API_TOKEN>`. This is a
+single-operator application: anyone with that token can access its jobs. For
+remote use, configure an HTTPS reverse proxy with request timeouts and body
+limits; preserve authentication and keep Redis private. Do not expose the Vite
+development server. A production frontend uses `/api` by default; route that
+prefix to the API with the prefix stripped, or set `VITE_API_URL` at build time.
+
+Defaults:
+
+| Setting | Default |
+| --- | --- |
+| `MAX_UPLOAD_MB` | 50 MB per PDF |
+| `MAX_PDF_PAGES` | 500 pages |
+| `MAX_ACTIVE_JOBS` | 8 admitted jobs across API processes |
+| Queue wait | 10 minutes before expiration |
+| Worker execution | 30 minutes maximum (prefork worker) |
+| `OCR_ALLOWED_ORIGINS` | localhost:5173 and 127.0.0.1:5173 |
+| File retention | 24 hours after processing, checked hourly |
+
+API uploads must include Content-Length. The full multipart request is capped
+at the upload limit plus 1 MB overhead; the saved file has its own byte limit.
+Metadata requests share admission limits. PDF headers, page counts, and page
+ranges are validated before queueing. Each job gets generated UUID directories
+under `uploads/` and `outputs/`; original filenames are display-only. Failed OCR
+pages fail the job and do not expose an incomplete document as a successful
+result. Failed or expired jobs also retain files until cleanup. Cleanup runs
+while the API is running, including at startup, and supports old flat files.
+
+## API
+
+- `POST /pdf-info`: PDF metadata.
+- `POST /upload`: multipart `file`, `mode`, `output_format`, `page_range`.
+- `GET /status/{task_id}`: progress; success includes `result.formats`.
+- `GET /download/{task_id}/{file_type}`: authenticated generated file.
+
 ```bash
-python processor.py input.pdf --mode ocr
+curl -H "Authorization: Bearer $OCR_API_TOKEN" \
+  -F 'file=@input.pdf' -F 'mode=ocr' -F 'output_format=docx' \
+  -F 'page_range=1-5, 8' http://127.0.0.1:8000/upload
 ```
 
-### Shrilipi Mode (legacy font PDFs)
+## CLI and tests
+
 ```bash
-python processor.py input.pdf --mode shrilipi
+python processor.py input.pdf --mode ocr --output_format docx --page_range '1-5'
+python processor.py input.pdf --mode shrilipi --output_format txt
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+(cd frontend && npm test && npm run lint && npm run build)
 ```
 
-### Options
-```
---output_docx   Output DOCX filename (optional)
---batch_size    Pages per batch for OCR (default: 5)
---dpi           DPI for image conversion (default: 300)
---lang          Tesseract language code (default: guj)
-```
-
-## API Endpoints
-
-- `POST /upload` - Upload PDF with mode selection
-- `GET /status/{task_id}` - Check processing status
-- `GET /download/{task_id}/docx` - Download output DOCX
-
-## Local files and credentials
-
-Run tools from this directory. Source PDFs are in `inputs/` or `uploads/`, and generated files are in `outputs/`. Book-specific scripts may need their input paths adjusted. Temporary diagnostics were preserved in the root cleanup archive.
-
-For Google Vision OCR, set `GOOGLE_APPLICATION_CREDENTIALS` to the absolute path of your local service-account JSON in `secrets/`. Credentials and working data are excluded from Git and Docker build context.
+The API tests mock the queue and PDF metadata tool; processor tests cover page
+failures, selection, and a real blank-PDF Shri Lipi conversion. Full OCR needs
+Tesseract and Poppler. Google Vision additionally needs your own credentials:
+set `GOOGLE_APPLICATION_CREDENTIALS` to the absolute path of the local service
+account JSON in `secrets/`. Credentials and working documents are ignored by
+Git and Docker. Book-specific scripts may need local input paths adjusted.

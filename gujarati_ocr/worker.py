@@ -1,5 +1,7 @@
 import os
 import logging
+from pathlib import Path
+from job_limits import TASK_TIME_LIMIT, release_job
 from celery import Celery
 from processor import GujaratiPDFProcessor, ProcessingMode
 
@@ -19,6 +21,12 @@ celery_app = Celery(
 
 celery_app.conf.update(
     task_track_started=True,
+    task_time_limit=TASK_TIME_LIMIT,
+    task_soft_time_limit=TASK_TIME_LIMIT - 30,
+    worker_prefetch_multiplier=1,
+    result_expires=24 * 3600,
+    broker_connection_timeout=5,
+    task_publish_retry=False,
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
@@ -115,17 +123,17 @@ def process_task(
         
     except Exception as e:
         logger.error(f"Task failed: {e}")
-        self.update_state(
-            state='FAILURE',
-            meta={
-                'current': 0,
-                'total': 100,
-                'status': f"Error: {str(e)}",
-                'exc_type': type(e).__name__,
-                'exc_message': str(e),
-            }
-        )
-        raise e
+        raise
+    finally:
+        # Retention starts after processing, not before a potentially long job.
+        for folder in {Path(input_path).parent, Path(output_docx_path).parent}:
+            if folder.exists():
+                os.utime(folder, None)
+        try:
+            release_job(self.request.id)
+        except Exception:
+            logger.exception("Could not release job lease; it will expire automatically.")
+
 
 
 # Keep backward compatibility alias

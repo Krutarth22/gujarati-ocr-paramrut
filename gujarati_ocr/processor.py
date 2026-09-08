@@ -31,6 +31,7 @@ except ImportError as e:
     sys.exit(1)
 
 from shri_lipi_converter import convert_shri_lipi_to_unicode
+from page_ranges import parse_page_range
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +118,8 @@ class GujaratiPDFProcessor:
         self.output_docx_path = output_docx_path
         self.output_pdf_path = output_pdf_path
         self.mode = mode
+        if batch_size < 1 or dpi < 1:
+            raise ValueError("Batch size and DPI must be positive.")
         self.batch_size = batch_size
         self.lang = lang
         self.dpi = dpi
@@ -177,28 +180,7 @@ class GujaratiPDFProcessor:
                 raise
 
     def _parse_page_range(self, total_pages: int) -> list:
-        """
-        Parse page range string into list of page numbers.
-        Examples: "1-5" -> [1,2,3,4,5], "1-3,5,7-9" -> [1,2,3,5,7,8,9]
-        """
-        if not self.page_range:
-            return list(range(1, total_pages + 1))
-        
-        pages = set()
-        parts = self.page_range.replace(' ', '').split(',')
-        
-        for part in parts:
-            if '-' in part:
-                start, end = part.split('-')
-                start = int(start)
-                end = int(end)
-                pages.update(range(start, min(end + 1, total_pages + 1)))
-            else:
-                page = int(part)
-                if 1 <= page <= total_pages:
-                    pages.add(page)
-        
-        return sorted(list(pages))
+        return parse_page_range(self.page_range, total_pages)
 
     def process(self, progress_callback: Optional[Callable[[int, str], None]] = None):
         """
@@ -245,6 +227,8 @@ class GujaratiPDFProcessor:
                                 dpi=self.dpi
                             )
                             
+                            if not images:
+                                raise RuntimeError("PDF renderer returned no image.")
                             if images:
                                 if self.ocr_engine == OCREngine.VISION:
                                     text = self._extract_page_text_vision(images[0])
@@ -263,8 +247,9 @@ class GujaratiPDFProcessor:
                                         if not self.text_only:
                                             pdf_bytes = pytesseract.image_to_pdf_or_hocr(temp_img_path, extension='pdf', lang=self.lang)
                                             pdf_page_reader = PdfReader(io.BytesIO(pdf_bytes))
-                                            if len(pdf_page_reader.pages) > 0:
-                                                pdf_writer.add_page(pdf_page_reader.pages[0])
+                                            if not pdf_page_reader.pages:
+                                                raise RuntimeError('OCR returned no searchable PDF page.')
+                                            pdf_writer.add_page(pdf_page_reader.pages[0])
 
                                         # 2. Extract Text for DOCX
                                         text = self._extract_page_text(
@@ -283,7 +268,7 @@ class GujaratiPDFProcessor:
                             del images
                         except Exception as e:
                             logger.error(f"Error processing page {page_num}: {e}")
-                            continue
+                            raise RuntimeError(f"OCR failed on page {page_num}; document is incomplete.") from e
                         
                         processed += 1
                         pbar.update(1)
@@ -481,7 +466,7 @@ class GujaratiPDFProcessor:
         colored_markup = (saturation_delta > 35) & (channels_max > 120)
         arr[colored_markup] = [255, 255, 255]
 
-        return Image.fromarray(arr, mode='RGB')
+        return Image.fromarray(arr)
 
     def _clean_text(self, text: str) -> str:
         """
@@ -993,10 +978,15 @@ def convert_docx_to_pdf(docx_path: str, pdf_path: str = None) -> str:
         output_dir = os.path.dirname(pdf_path) or "."
         
         logger.info(f"Attempting PDF conversion with LibreOffice...")
-        result = subprocess.run([
-            soffice_cmd, '--headless', '--convert-to', 'pdf',
-            '--outdir', output_dir, docx_path
-        ], capture_output=True, text=True, timeout=120)
+        # Each worker gets its own LibreOffice profile so concurrent conversions
+        # cannot attach to another job's process and return before output exists.
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(prefix='ocr-libreoffice-') as profile:
+            result = subprocess.run([
+                soffice_cmd, f'-env:UserInstallation={Path(profile).as_uri()}',
+                '--headless', '--convert-to', 'pdf',
+                '--outdir', output_dir, docx_path
+            ], capture_output=True, text=True, timeout=120)
         
         if result.returncode == 0:
             # LibreOffice outputs to same basename with .pdf

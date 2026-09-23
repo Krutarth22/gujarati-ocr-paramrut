@@ -1,0 +1,85 @@
+{
+  "source": "outputs/atma_koch_full/Atma_Koch_Shibir_2000_ocr.txt",
+  "output": "outputs/atma_koch_full/Atma_Khoj_Shibir_2000.epub",
+  "title": "આત્મખોજ શિબિર ૨૦૦૦",
+  "display_title": "આત્મખોજ શિબિર",
+  "subtitle": "૨૦૦૦",
+  "authors": [
+    "સ્વામીશ્રીજી"
+  ],
+  "language": "gu",
+  "identifier": "urn:atma-khoj-shibir:2000",
+  "contents_title": "અનુક્રમણિકા",
+  "running_headers": [
+    "સ્વામીશ્રીજી",
+    "અંબરીષ હૉલ.",
+    "અંબરિય હોલ"
+  ],
+  "running_header_prefixes": [
+    "તા."
+  ],
+  "header_scan_lines": 8,
+  "chapters": [
+    {
+      "title": "સંબંધયોગ",
+      "start_page": 2,
+      "end_page": 16,
+      "date": "૭ ઑક્ટોબર ૨૦૦૦"
+    },
+    {
+      "title": "ધ્યેયનિષ્ઠા",
+      "start_page": 17,
+      "end_page": 28,
+      "date": "૭ ઑક્ટોબર ૨૦૦૦"
+    },
+    {
+      "title": "માન ટળે ભાવે સેવા…",
+      "start_page": 29,
+      "end_page": 49,
+      "date": "૮ ઑક્ટોબર ૨૦૦૦",
+      "headers": [
+        "‘માન ટળે ભાવે સેવા...’",
+        "‘માન ટળે ભાવે સેવા..'",
+        "‘માન ટળે ભાવે સેવા…’"
+      ]
+    },
+    {
+      "title": "વચનામૃત ગઢડા પ્રથમ-૩૨",
+      "start_page": 50,
+      "end_page": 66,
+      "date": "૯ ઑક્ટોબર ૨૦૦૦",
+      "headers": [
+        "વચનામૃત ગઢડા પ્રથમ-૩૨",
+        "વચનામૃત ગઢડા પ્રથમ-૩૨: નિરૂપણ"
+      ]
+    },
+    {
+      "title": "ગુણના પ્રવાહ",
+      "start_page": 67,
+      "end_page": 86,
+      "date": "૧૦ ઑક્ટોબર ૨૦૦૦"
+    },
+    {
+      "title": "રસાસ્વાદ",
+      "start_page": 87,
+      "end_page": 119,
+      "date": "૧૧ ઑક્ટોબર ૨૦૦૦",
+      "headers": [
+        "રસાસ્વાદ",
+        "રસસ્વાદ"
+      ]
+    },
+    {
+      "title": "નિત્ય લાખ રૂપિયા લાવે…",
+      "start_page": 120,
+      "end_page": 132,
+      "date": "૧૩ ઑક્ટોબર ૨૦૦૦",
+      "note": "શરદ પૂર્ણિમા",
+      "headers": [
+        "‘નિત્ય લાખ રૂપિયા લાવે...’",
+        "‘નિત્ય લાખ રૂપિયા લાવે…’",
+        "‘નિત્ય લાખ રૂપિયા લાવે’"
+      ]
+    }
+  ]
+}
